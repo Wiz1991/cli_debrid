@@ -27,6 +27,16 @@ bazarr_bp = Blueprint('bazarr', __name__)
 # Process start time for system status
 PROCESS_START_TIME = datetime.now(timezone.utc)
 
+
+@bazarr_bp.after_request
+def add_no_cache_headers(response):
+    """Add no-cache headers to API responses to ensure Bazarr gets fresh data."""
+    if '/api/' in request.path:
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+    return response
+
 # ============================================================================
 # Authentication
 # ============================================================================
@@ -117,51 +127,86 @@ def get_collected_series() -> List[Dict[str, Any]]:
     try:
         cursor = conn.cursor()
         # Get unique shows with their metadata
+        # Group by imdb_id first (if available), otherwise by tmdb_id
+        # This ensures we don't accidentally merge different shows
         cursor.execute("""
             SELECT DISTINCT
-                COALESCE(imdb_id, tmdb_id) as show_id,
                 imdb_id, tmdb_id, title, year, genres, runtime
             FROM media_items
             WHERE state = 'Collected'
             AND type = 'episode'
             AND (file_path IS NOT NULL OR location_on_disk IS NOT NULL)
-            GROUP BY COALESCE(imdb_id, tmdb_id), title
+            GROUP BY CASE WHEN imdb_id IS NOT NULL THEN imdb_id ELSE tmdb_id END
             ORDER BY title
         """)
 
         series_list = []
         for row in cursor.fetchall():
+            # Determine the primary ID to use for matching
+            imdb_id = row[0]
+            tmdb_id = row[1]
+            # Use imdb_id if available, otherwise tmdb_id
+            # Also track which field was used for precise matching later
             series_list.append({
-                'show_id': row[0],
-                'imdb_id': row[1],
-                'tmdb_id': row[2],
-                'title': row[3],
-                'year': row[4],
-                'genres': row[5],
-                'runtime': row[6]
+                'show_id': imdb_id or tmdb_id,
+                'imdb_id': imdb_id,
+                'tmdb_id': tmdb_id,
+                'title': row[2],
+                'year': row[3],
+                'genres': row[4],
+                'runtime': row[5],
+                # Track which ID type was used for the show_id
+                'id_type': 'imdb' if imdb_id else 'tmdb'
             })
         return series_list
     finally:
         conn.close()
 
 
-def get_episodes_for_series(show_id: str) -> List[Dict[str, Any]]:
-    """Get all collected episodes for a specific series."""
+def get_episodes_for_series(show_id: str, id_type: str = None) -> List[Dict[str, Any]]:
+    """Get all collected episodes for a specific series.
+
+    Args:
+        show_id: The show identifier (imdb_id or tmdb_id)
+        id_type: Either 'imdb' or 'tmdb' to specify which column to match.
+                 If None, will be auto-detected based on show_id format.
+    """
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute("""
-            SELECT id, imdb_id, tmdb_id, title, episode_title, year,
-                   season_number, episode_number, file_path,
-                   location_on_disk, collected_at, version,
-                   filled_by_file, resolution
-            FROM media_items
-            WHERE state = 'Collected'
-            AND type = 'episode'
-            AND (imdb_id = ? OR tmdb_id = ?)
-            AND (file_path IS NOT NULL OR location_on_disk IS NOT NULL)
-            ORDER BY season_number, episode_number
-        """, (show_id, show_id))
+
+        # Auto-detect ID type if not specified
+        if id_type is None:
+            # IMDb IDs start with 'tt', TMDB IDs are numeric
+            id_type = 'imdb' if (show_id and str(show_id).startswith('tt')) else 'tmdb'
+
+        # Use precise matching on only the correct column to avoid cross-matching
+        if id_type == 'imdb':
+            cursor.execute("""
+                SELECT id, imdb_id, tmdb_id, title, episode_title, year,
+                       season_number, episode_number, file_path,
+                       location_on_disk, collected_at, version,
+                       filled_by_file, resolution
+                FROM media_items
+                WHERE state = 'Collected'
+                AND type = 'episode'
+                AND imdb_id = ?
+                AND (file_path IS NOT NULL OR location_on_disk IS NOT NULL)
+                ORDER BY season_number, episode_number
+            """, (show_id,))
+        else:
+            cursor.execute("""
+                SELECT id, imdb_id, tmdb_id, title, episode_title, year,
+                       season_number, episode_number, file_path,
+                       location_on_disk, collected_at, version,
+                       filled_by_file, resolution
+                FROM media_items
+                WHERE state = 'Collected'
+                AND type = 'episode'
+                AND tmdb_id = ?
+                AND (file_path IS NOT NULL OR location_on_disk IS NOT NULL)
+                ORDER BY season_number, episode_number
+            """, (show_id,))
 
         episodes = []
         for row in cursor.fetchall():
@@ -231,7 +276,6 @@ def get_series_by_id(series_id: int) -> Optional[Dict[str, Any]]:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT DISTINCT
-                COALESCE(imdb_id, tmdb_id) as show_id,
                 imdb_id, tmdb_id, title, year, genres, runtime
             FROM media_items
             WHERE (id = ? OR tmdb_id = ? OR tmdb_id = ? OR imdb_id = ?)
@@ -242,14 +286,17 @@ def get_series_by_id(series_id: int) -> Optional[Dict[str, Any]]:
 
         row = cursor.fetchone()
         if row:
+            imdb_id = row[0]
+            tmdb_id = row[1]
             return {
-                'show_id': row[0],
-                'imdb_id': row[1],
-                'tmdb_id': row[2],
-                'title': row[3],
-                'year': row[4],
-                'genres': row[5],
-                'runtime': row[6]
+                'show_id': imdb_id or tmdb_id,
+                'imdb_id': imdb_id,
+                'tmdb_id': tmdb_id,
+                'title': row[2],
+                'year': row[3],
+                'genres': row[4],
+                'runtime': row[5],
+                'id_type': 'imdb' if imdb_id else 'tmdb'
             }
         return None
     finally:
@@ -997,7 +1044,7 @@ def get_series():
         series_list = get_collected_series()
         result = []
         for s in series_list:
-            episodes = get_episodes_for_series(s.get('show_id', ''))
+            episodes = get_episodes_for_series(s.get('show_id', ''), s.get('id_type'))
             result.append(create_series_resource(s, episodes))
         return jsonify(result)
     except Exception as e:
@@ -1012,7 +1059,7 @@ def get_series_by_id_route(series_id: int):
     try:
         series = get_series_by_id(series_id)
         if series:
-            episodes = get_episodes_for_series(series.get('show_id', ''))
+            episodes = get_episodes_for_series(series.get('show_id', ''), series.get('id_type'))
             return jsonify(create_series_resource(series, episodes))
         return jsonify({'error': 'Series not found'}), 404
     except Exception as e:
@@ -1036,7 +1083,7 @@ def get_episodes():
             return jsonify([])
 
         series_title = series.get('title', 'Unknown')
-        episodes = get_episodes_for_series(series.get('show_id', ''))
+        episodes = get_episodes_for_series(series.get('show_id', ''), series.get('id_type'))
         return jsonify([create_episode_resource(ep, series_id, series_title) for ep in episodes])
     except Exception as e:
         logging.error(f"Error getting episodes for Bazarr: {e}")
@@ -1060,7 +1107,7 @@ def get_episode_files():
         if not series:
             return jsonify([])
 
-        episodes = get_episodes_for_series(series.get('show_id', ''))
+        episodes = get_episodes_for_series(series.get('show_id', ''), series.get('id_type'))
         return jsonify([create_episode_file_resource(ep, series_id) for ep in episodes])
     except Exception as e:
         logging.error(f"Error getting episode files for Bazarr: {e}")
